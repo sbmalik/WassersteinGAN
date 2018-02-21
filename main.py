@@ -1,4 +1,7 @@
 from __future__ import print_function
+# Custom tensorboard logging
+from TbLogger import Logger
+
 import argparse
 import random
 import torch
@@ -15,6 +18,8 @@ import os
 
 import models.dcgan as dcgan
 import models.mlp as mlp
+from FastImageFolder import FastImageFolder
+import pickle
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--dataset', required=True, help='cifar10 | lsun | imagenet | folder | lfw ')
@@ -43,8 +48,30 @@ parser.add_argument('--mlp_D', action='store_true', help='use MLP for D')
 parser.add_argument('--n_extra_layers', type=int, default=0, help='Number of extra layers on gen and disc')
 parser.add_argument('--experiment', default=None, help='Where to store samples and models')
 parser.add_argument('--adam', action='store_true', help='Whether to use adam (default is rmsprop)')
+parser.add_argument('--tensorboard', action='store_true', help='Whether to use Tensorboard')
+parser.add_argument('--tensorboard_images', action='store_true', help='Whether to use Tensorboard to diplay images')
+parser.add_argument('--imgList', help='path to pre-processed image list for fast folder')
 opt = parser.parse_args()
 print(opt)
+
+
+def to_np(x):
+    x = x.cpu().numpy()
+    if len(x.shape)>3:
+        return x[:,0:3,:,:]
+    else:
+        return x
+
+# remove the log file if it exists if we run the script in the training mode
+print('Folder {} delete triggered'.format(opt.experiment))
+try:
+    shutil.rmtree('tb_logs/{}/'.format(opt.experiment))
+except:
+    pass
+
+# Set the Tensorboard logger
+if opt.tensorboard or opt.tensorboard_images:
+    logger = Logger('./tb_logs/{}'.format(opt.experiment))
 
 if opt.experiment is None:
     opt.experiment = 'samples'
@@ -85,6 +112,18 @@ elif opt.dataset == 'cifar10':
                                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
                            ])
     )
+elif opt.dataset == 'fastfolder':
+    # load the pre-processed list of images
+    with open(opt.imgList, 'rb') as handle:
+        img_list = pickle.load(handle)
+    # fast folder dataset
+    dataset = FastImageFolder(root=opt.dataroot,img_list = img_list,
+                              transform=transforms.Compose([
+                                   transforms.Scale(opt.imageSize),
+                                   transforms.CenterCrop(opt.imageSize),
+                                   transforms.ToTensor(),
+                                   transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+                               ]))    
 assert dataset
 dataloader = torch.utils.data.DataLoader(dataset, batch_size=opt.batchSize,
                                          shuffle=True, num_workers=int(opt.workers))
@@ -113,6 +152,7 @@ else:
     netG = dcgan.DCGAN_G(opt.imageSize, nz, nc, ngf, ngpu, n_extra_layers)
 
 netG.apply(weights_init)
+
 if opt.netG != '': # load checkpoint if needed
     netG.load_state_dict(torch.load(opt.netG))
 print(netG)
@@ -149,6 +189,7 @@ else:
     optimizerG = optim.RMSprop(netG.parameters(), lr = opt.lrG)
 
 gen_iterations = 0
+tb_steps = 0
 for epoch in range(opt.niter):
     data_iter = iter(dataloader)
     i = 0
@@ -217,12 +258,44 @@ for epoch in range(opt.niter):
         print('[%d/%d][%d/%d][%d] Loss_D: %f Loss_G: %f Loss_D_real: %f Loss_D_fake %f'
             % (epoch, opt.niter, i, len(dataloader), gen_iterations,
             errD.data[0], errG.data[0], errD_real.data[0], errD_fake.data[0]))
+
+        #============ TensorBoard logging ============#
+        # Log the scalar values        
+        if opt.tensorboard:
+            info = {
+                'Loss_D': errD.data[0],
+                'Loss_G': errG.data[0],
+                'Loss_D_real': errD_real.data[0],    
+                'Loss_D_fake': errD_fake.data[0],                    
+            }
+            for tag, value in info.items():
+                logger.scalar_summary(tag, value, tb_steps)
+
+        tb_steps += 1
+        
         if gen_iterations % 500 == 0:
             real_cpu = real_cpu.mul(0.5).add(0.5)
             vutils.save_image(real_cpu, '{0}/real_samples.png'.format(opt.experiment))
             fake = netG(Variable(fixed_noise, volatile=True))
             fake.data = fake.data.mul(0.5).add(0.5)
             vutils.save_image(fake.data, '{0}/fake_samples_{1}.png'.format(opt.experiment, gen_iterations))
+            
+            #============ TensorBoard logging ============#              
+            # Show real samples
+            if opt.tensorboard_images:
+                info = {
+                    'real_samples': to_np(real_cpu.view(-1,opt.nc,opt.imageSize, opt.imageSize)[:50])
+                }
+                for tag, images in info.items():
+                    logger.image_summary(tag, images, tb_steps)
+            # Show fake samples
+            if opt.tensorboard_images:
+                info = {
+                    'fake_samples': to_np(fake.data.view(-1,opt.nc,opt.imageSize, opt.imageSize)[:50])
+                }
+                for tag, images in info.items():
+                    logger.image_summary(tag, images, tb_steps)           
+            
 
     # do checkpointing
     torch.save(netG.state_dict(), '{0}/netG_epoch_{1}.pth'.format(opt.experiment, epoch))
